@@ -3,19 +3,20 @@ import json
 import requests
 import discord
 from discord.ext import commands, tasks
-from keep_alive import keep_alive  # 👈 this will keep Render/Replit awake
+from keep_alive import keep_alive  # 👈 keeps Render service alive
 
 # ===== CONFIG =====
 TOKEN = os.getenv("TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "1433997173258715166"))
+CLIENT_UID = os.getenv("CLIENT_UID", "154T-BFD91-4B8S")
+UPDATE_MINUTES = int(os.getenv("UPDATE_MINUTES", "5"))
+
+# Leaderboard identifiers
+LEADERBOARD_UID = "1565-GC91E-MKCX"
+EXPECTED_LB_NAME = "3dhaxxCpu"  # what SBX shows as name
+FALLBACK_TITLE = "CPU Leaderboard"  # what you display in Discord
 
 TRPC_URL = "https://www.sbx.com/api/trpc/referral.getPublicLeaderBoard"
-LEADERBOARD_UID = "1565-GC91E-MKCX"
-
-# 👇 from your browser request
-CLIENT_UID = os.getenv("CLIENT_UID", "154T-BFD91-4B8S")
-
-UPDATE_MINUTES = int(os.getenv("UPDATE_MINUTES", "5"))
 # ===================
 
 intents = discord.Intents.default()
@@ -25,6 +26,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 leaderboard_message_id = None
 
 
+# ===== FETCHING =====
 def fetch_sbx_leaderboard():
     """
     Call SBX exactly like the page does, but only for the leaderboard.
@@ -59,9 +61,43 @@ def fetch_sbx_leaderboard():
     raise ValueError(f"Unexpected SBX response: {data}")
 
 
+# ===== VALIDATION =====
+def is_expected_leaderboard(lb_data):
+    """
+    Returns True only if the SBX response looks like *our* leaderboard.
+    """
+    if not isinstance(lb_data, dict):
+        return False
+
+    # unwrap if needed
+    if "json" in lb_data and isinstance(lb_data["json"], dict):
+        lb_data = lb_data["json"]
+
+    name = lb_data.get("name") or lb_data.get("title") or ""
+    uid = lb_data.get("leaderboardUid") or lb_data.get("uid") or ""
+
+    if name.lower() == EXPECTED_LB_NAME.lower():
+        return True
+    if uid == LEADERBOARD_UID:
+        return True
+
+    return False
+
+
+def has_enough_users(lb_data, min_users=2):
+    """
+    Optional safeguard to avoid posting empty/partial data.
+    """
+    if "json" in lb_data:
+        lb_data = lb_data["json"]
+    users = lb_data.get("users") or []
+    return len(users) >= min_users
+
+
+# ===== FORMAT =====
 def format_leaderboard(lb_data, limit=10):
     """
-    Your SBX response was:
+    Your SBX response looks like:
     {
       "json": {
         "name": "3dhaxxCpu",
@@ -73,20 +109,9 @@ def format_leaderboard(lb_data, limit=10):
     if isinstance(lb_data, dict) and "json" in lb_data:
         lb_data = lb_data["json"]
 
-    # hard-code your title like you wanted
-    title = "CPU Leaderboard"
-
-    users = (
-        lb_data.get("users")
-        or lb_data.get("entries")
-        or lb_data.get("rankings")
-        or []
-    )
-
-    prizes = []
-    cfg = lb_data.get("config")
-    if isinstance(cfg, dict):
-        prizes = cfg.get("prizeSimple") or []
+    title = FALLBACK_TITLE
+    users = lb_data.get("users") or lb_data.get("entries") or lb_data.get("rankings") or []
+    prizes = lb_data.get("config", {}).get("prizeSimple", [])
 
     lines = [f"**{title}** 🔁 (auto-updates)"]
 
@@ -97,12 +122,7 @@ def format_leaderboard(lb_data, limit=10):
     for i, user in enumerate(users[:limit], start=1):
         rank = user.get("position") or i
         name = user.get("username") or user.get("nickname") or "Unknown"
-        wagered = (
-            user.get("totalWagered")
-            or user.get("wagered")
-            or user.get("amount")
-            or 0
-        )
+        wagered = user.get("totalWagered") or user.get("wagered") or user.get("amount") or 0
 
         try:
             wagered_txt = f"USD ${float(wagered):,.2f}"
@@ -119,6 +139,7 @@ def format_leaderboard(lb_data, limit=10):
     return "\n".join(lines)
 
 
+# ===== DISCORD EVENTS =====
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
@@ -130,6 +151,16 @@ async def setlb(ctx):
     global leaderboard_message_id
     lb_data = fetch_sbx_leaderboard()
     print("SBX RAW DATA:", lb_data)
+
+    # Validate correct leaderboard
+    if not is_expected_leaderboard(lb_data):
+        await ctx.send("⚠️ Received data from a different leaderboard — update skipped.")
+        return
+
+    if not has_enough_users(lb_data):
+        await ctx.send("⚠️ Leaderboard data incomplete — skipped this update.")
+        return
+
     txt = format_leaderboard(lb_data)
     msg = await ctx.send(txt)
     leaderboard_message_id = msg.id
@@ -145,10 +176,20 @@ async def update_leaderboard():
 
     try:
         lb_data = fetch_sbx_leaderboard()
-        new_text = format_leaderboard(lb_data)
     except Exception as e:
         await channel.send(f"⚠️ SBX update failed: `{e}`")
         return
+
+    # Validate correct leaderboard
+    if not is_expected_leaderboard(lb_data):
+        print("⚠️ Skipped SBX update — wrong leaderboard returned")
+        return
+
+    if not has_enough_users(lb_data):
+        print("⚠️ Skipped SBX update — not enough rows")
+        return
+
+    new_text = format_leaderboard(lb_data)
 
     if leaderboard_message_id is None:
         msg = await channel.send(new_text)
@@ -168,8 +209,7 @@ async def before_update():
     await bot.wait_until_ready()
 
 
+# ===== START BOT =====
 if __name__ == "__main__":
-    # start tiny web server
-    from keep_alive import keep_alive
     keep_alive()
     bot.run(TOKEN)
